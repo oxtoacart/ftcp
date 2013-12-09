@@ -7,12 +7,21 @@ ftcp can work with both plain text connections (see Dial()) and TLS connections
 
 Example:
 
-package main
+	package main
+	
+	import (
+		"github.com/oxtoacart/ftcp"
+	)
+	
+	func main() {
+		// Replace host:port with an actual TCP server, for example the echo service
+		if conn, err := ftcp.Dial("host:port"); err == nil {
+			framedConn.Write([]byte("Hello World"))
+			msg := framedConn.Read()
+		}
+	}
 
-import (
-	"github.com/oxtoacart/ftcp"
-)
-
+TODO: add auto-reconnect and proper error handling
 */
 package ftcp
 
