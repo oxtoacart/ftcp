@@ -11,13 +11,17 @@ Example:
 
 	import (
 		"github.com/oxtoacart/ftcp"
+		"log"
 	)
 
 	func main() {
 		// Replace host:port with an actual TCP server, for example the echo service
 		if conn, err := ftcp.Dial("host:port"); err == nil {
-			framedConn.Write([]byte("Hello World"))
-			msg := framedConn.Read()
+			if err := framedConn.Write([]byte("Hello World")); err == nil {
+				if msg, err := framedConn.Read(); err == nil {
+					log.Println("We're done!")
+				}
+			}
 		}
 	}
 
