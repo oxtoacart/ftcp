@@ -1,5 +1,5 @@
 /*
-Package ftcp implements a basic framed messaging protocol over TCP, based on
+Package ftcp implements a basic framed messaging protocol over TCP/TLS, based on
 github.com/oxtoacart/framed.
 
 ftcp can work with both plain text connections (see Dial()) and TLS connections
