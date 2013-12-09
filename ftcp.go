@@ -8,11 +8,11 @@ ftcp can work with both plain text connections (see Dial()) and TLS connections
 Example:
 
 	package main
-	
+
 	import (
 		"github.com/oxtoacart/ftcp"
 	)
-	
+
 	func main() {
 		// Replace host:port with an actual TCP server, for example the echo service
 		if conn, err := ftcp.Dial("host:port"); err == nil {
@@ -21,7 +21,7 @@ Example:
 		}
 	}
 
-TODO: add auto-reconnect and proper error handling
+TODO: add auto-reconnect functionality
 */
 package ftcp
 
@@ -45,13 +45,14 @@ Conn is an ftcp connection to which one can write []byte frames using Write()
 and from which one can receive Messages using Read().
 
 Multiple goroutines may invoke methods on a Conn simultaneously.
-*/ 
+*/
 type Conn struct {
 	stream   framed.Framed
 	orig     interface{}
 	writeCh  chan []byte
 	readCh   chan []byte
 	messages chan Message
+	errors   chan error
 	closed   bool
 }
 
@@ -129,8 +130,27 @@ func (conn Conn) Write(msg []byte) {
 /*
 Read reads the next message to arrive on the connection.
 */
-func (conn Conn) Read() (msg Message) {
-	return <-conn.messages
+func (conn Conn) Read() (msg Message, err error) {
+	select {
+	case msg = <-conn.messages:
+		return
+	case err = <-conn.errors:
+		return
+	}
+}
+
+/*
+Close closes the connection.
+*/
+func (conn Conn) Close() (err error) {
+	switch orig := conn.orig.(type) {
+	case *net.Conn:
+		err = (*orig).Close()
+	case *tls.Conn:
+		err = orig.Close()
+	}
+	conn.closed = true
+	return
 }
 
 /*
@@ -143,6 +163,7 @@ func newConn(orig net.Conn) (conn Conn) {
 		writeCh:  make(chan []byte),
 		readCh:   make(chan []byte),
 		messages: make(chan Message),
+		errors:   make(chan error),
 		closed:   false,
 	}
 
@@ -154,12 +175,13 @@ func newConn(orig net.Conn) (conn Conn) {
 
 /*
 Read on goroutine.  Doing our reads on a single goroutine ensures that length
-prefixes and their corresponding frames are read in the correct order. 
+prefixes and their corresponding frames are read in the correct order.
 */
 func (conn Conn) read() {
 	for conn.closed == false {
 		if frame, err := conn.stream.ReadFrame(); err != nil {
-			// TODO: reconnect
+			// TODO: catch EOF and try reconnecting
+			conn.errors <- err
 		} else {
 			conn.readCh <- frame
 		}
@@ -173,7 +195,10 @@ func (conn Conn) process() {
 	for conn.closed == false {
 		select {
 		case frame := <-conn.writeCh:
-			conn.stream.WriteFrame(frame)
+			if err := conn.stream.WriteFrame(frame); err != nil {
+				// TODO: catch EOF and try reconnecting
+				conn.errors <- err
+			}
 		case frame := <-conn.readCh:
 			var connectionState tls.ConnectionState
 			switch orig := conn.orig.(type) {
