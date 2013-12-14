@@ -52,7 +52,7 @@ Message encapsulates a message received from an ftcp connection, including both
 the data (payload) of the message and, if using TLS, the tls.ConnectionState.
 */
 type Message struct {
-	data     []byte
+	Data     []byte
 	TLSState tls.ConnectionState
 }
 

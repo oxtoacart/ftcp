@@ -43,7 +43,7 @@ func doTest(t *testing.T, forceClose bool) {
 					continue
 				}
 				if msg, err := conn.Read(); err == nil {
-					receivedOut = string(msg.data)
+					receivedOut = string(msg.Data)
 					conn.Write([]byte(expectedIn))
 				}
 				return
@@ -68,7 +68,7 @@ func doTest(t *testing.T, forceClose bool) {
 		if msg, err := conn.Read(); err != nil {
 			errFromGoroutine = fmt.Errorf("Error reading response: %s", err)
 		} else {
-			receivedIn = string(msg.data)
+			receivedIn = string(msg.Data)
 		}
 	}()
 
