@@ -6,11 +6,11 @@ import (
 	"time"
 )
 
-func TestPlain(t *testing.T) {
+func TestWithoutClose(t *testing.T) {
 	doTest(t, false)
 }
 
-func TestRedialing(t *testing.T) {
+func TestWithClose(t *testing.T) {
 	doTest(t, true)
 }
 

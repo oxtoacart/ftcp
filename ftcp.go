@@ -5,6 +5,11 @@ github.com/oxtoacart/framed.
 ftcp can work with both plain text connections (see Dial()) and TLS connections
 (see DialTLS()).
 
+Connections opened with Dial() or DialTLS() automatically redial whenever
+they encounter an error.  If the redial can't successfully complete within
+DEFAULT_REDIAL_TIMEOUT milliseconds, then the connection gives up and returns an
+error.
+
 Example:
 
 	package main
@@ -37,9 +42,9 @@ import (
 )
 
 const (
-	WRITE_QUEUE_DEPTH = 1000
-	BACKOFF_MS        = 20
-	RETRY_TIMEOUT     = 60000
+	DEFAULT_WRITE_QUEUE_DEPTH = 1000
+	BACKOFF_MS                = 20
+	DEFAULT_REDIAL_TIMEOUT    = 60000
 )
 
 /*
@@ -58,18 +63,19 @@ and from which one can receive Messages using Read().
 Multiple goroutines may invoke methods on a Conn simultaneously.
 */
 type Conn struct {
-	addr        string
-	tlsConfig   *tls.Config
-	autoRedial  bool
-	orig        interface{}
-	stream      *framed.Framed
-	writeCh     chan []byte
-	messages    chan Message
-	readErrors  chan error
-	writeErrors chan error
-	readError   chan error
-	readStream  chan *framed.Framed
-	stop        chan interface{}
+	addr            string
+	redialTimeout   time.Duration
+	tlsConfig       *tls.Config
+	autoRedial      bool
+	orig            interface{}
+	stream          *framed.Framed
+	writeCh         chan []byte
+	messages        chan Message
+	readErrors      chan error
+	writeErrors     chan error
+	readError       chan error
+	readStream      chan *framed.Framed
+	stop            chan interface{}
 }
 
 /*
@@ -243,14 +249,15 @@ func (conn *Conn) SetWriteDeadline(t time.Time) error {
 
 func newConn(addr string) (conn *Conn) {
 	return &Conn{
-		addr:        addr,
-		writeCh:     make(chan []byte, WRITE_QUEUE_DEPTH),
-		messages:    make(chan Message),
-		readErrors:  make(chan error),
-		writeErrors: make(chan error),
-		readError:   make(chan error),
-		readStream:  make(chan *framed.Framed),
-		stop:        make(chan interface{}),
+		addr:            addr,
+		redialTimeout:   DEFAULT_REDIAL_TIMEOUT,
+		writeCh:         make(chan []byte, DEFAULT_WRITE_QUEUE_DEPTH),
+		messages:        make(chan Message),
+		readErrors:      make(chan error),
+		writeErrors:     make(chan error),
+		readError:       make(chan error),
+		readStream:      make(chan *framed.Framed),
+		stop:            make(chan interface{}),
 	}
 }
 
@@ -282,7 +289,7 @@ succeeds, redial returns the most recent error from dial.
 */
 func (conn *Conn) redial(start time.Time, backoff time.Duration) (err error) {
 	for {
-		if time.Now().Sub(start) > RETRY_TIMEOUT {
+		if time.Now().Sub(start) > conn.redialTimeout {
 			// We're done trying to back off, just return the error
 			return
 		}
