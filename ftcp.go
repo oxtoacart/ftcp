@@ -63,19 +63,19 @@ and from which one can receive Messages using Read().
 Multiple goroutines may invoke methods on a Conn simultaneously.
 */
 type Conn struct {
-	addr            string
-	redialTimeout   time.Duration
-	tlsConfig       *tls.Config
-	autoRedial      bool
-	orig            interface{}
-	stream          *framed.Framed
-	writeCh         chan []byte
-	messages        chan Message
-	readErrors      chan error
-	writeErrors     chan error
-	readError       chan error
-	readStream      chan *framed.Framed
-	stop            chan interface{}
+	addr          string
+	redialTimeout time.Duration
+	tlsConfig     *tls.Config
+	autoRedial    bool
+	orig          interface{}
+	stream        *framed.Framed
+	writeCh       chan []byte
+	messages      chan Message
+	readErrors    chan error
+	writeErrors   chan error
+	readError     chan error
+	readStream    chan *framed.Framed
+	stop          chan interface{}
 }
 
 /*
@@ -249,15 +249,15 @@ func (conn *Conn) SetWriteDeadline(t time.Time) error {
 
 func newConn(addr string) (conn *Conn) {
 	return &Conn{
-		addr:            addr,
-		redialTimeout:   DEFAULT_REDIAL_TIMEOUT,
-		writeCh:         make(chan []byte, DEFAULT_WRITE_QUEUE_DEPTH),
-		messages:        make(chan Message),
-		readErrors:      make(chan error),
-		writeErrors:     make(chan error),
-		readError:       make(chan error),
-		readStream:      make(chan *framed.Framed),
-		stop:            make(chan interface{}),
+		addr:          addr,
+		redialTimeout: DEFAULT_REDIAL_TIMEOUT,
+		writeCh:       make(chan []byte, DEFAULT_WRITE_QUEUE_DEPTH),
+		messages:      make(chan Message),
+		readErrors:    make(chan error),
+		writeErrors:   make(chan error),
+		readError:     make(chan error),
+		readStream:    make(chan *framed.Framed),
+		stop:          make(chan interface{}),
 	}
 }
 
