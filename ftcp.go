@@ -24,15 +24,22 @@ Example:
 			}
 		}
 	}
-
-TODO: add auto-reconnect functionality
 */
 package ftcp
 
 import (
 	"crypto/tls"
+	"fmt"
 	"github.com/oxtoacart/framed"
+	"io"
 	"net"
+	"time"
+)
+
+const (
+	WRITE_QUEUE_DEPTH = 1000
+	BACKOFF_MS        = 20
+	RETRY_TIMEOUT     = 60000
 )
 
 /*
@@ -51,13 +58,18 @@ and from which one can receive Messages using Read().
 Multiple goroutines may invoke methods on a Conn simultaneously.
 */
 type Conn struct {
-	stream   framed.Framed
-	orig     interface{}
-	writeCh  chan []byte
-	readCh   chan []byte
-	messages chan Message
-	errors   chan error
-	closed   bool
+	addr        string
+	tlsConfig   *tls.Config
+	autoRedial  bool
+	orig        interface{}
+	stream      *framed.Framed
+	writeCh     chan []byte
+	messages    chan Message
+	readErrors  chan error
+	writeErrors chan error
+	readError   chan error
+	readStream  chan *framed.Framed
+	stop        chan interface{}
 }
 
 /*
@@ -71,10 +83,11 @@ type Listener struct {
 /*
 Dial opens a tcp connection to the given address, similarly to net.Dial.
 */
-func Dial(addr string) (conn Conn, err error) {
-	var orig net.Conn
-	if orig, err = net.Dial("tcp", addr); err == nil {
-		conn = newConn(orig)
+func Dial(addr string) (conn *Conn, err error) {
+	conn = newConn(addr)
+	conn.autoRedial = true
+	if err = conn.dial(); err == nil {
+		conn.run()
 	}
 	return
 }
@@ -83,10 +96,15 @@ func Dial(addr string) (conn Conn, err error) {
 Dial opens a TLS connection to the given address with the given (optional)
 tls.Config, similarly to tls.Dial.
 */
-func DialTLS(addr string, config *tls.Config) (conn Conn, err error) {
-	var orig *tls.Conn
-	if orig, err = tls.Dial("tcp", addr, config); err == nil {
-		conn = newConn(orig)
+func DialTLS(addr string, config *tls.Config) (conn *Conn, err error) {
+	conn = newConn(addr)
+	conn.autoRedial = true
+	conn.tlsConfig = config
+	if conn.tlsConfig == nil {
+		conn.tlsConfig = new(tls.Config)
+	}
+	if err = conn.dial(); err == nil {
+		conn.run()
 	}
 	return
 }
@@ -116,29 +134,52 @@ func ListenTLS(laddr string, config *tls.Config) (listener Listener, err error) 
 /*
 Accept accepts a new connection on, similarly to net.Listener.Accept.
 */
-func (listener *Listener) Accept() (conn Conn, err error) {
+func (listener *Listener) Accept() (conn *Conn, err error) {
 	var orig net.Conn
 	if orig, err = listener.Listener.Accept(); err == nil {
-		conn = newConn(orig)
+		conn = newConn("")
+		conn.orig = &orig
+		conn.stream = &framed.Framed{orig}
+		conn.run()
 	}
 	return
 }
 
 /*
 Write requests a write of the given message frame to the connection.
+
+If the connection is autoRedial, this write will be queued for delivery after
+redial can be successfully completed.  If the number of queued messages equals
+the WRITE_QUEUE_DEPTH, Write will block until the queue can start to be drained
+again.
+
+If the connection is not autoRedial, Write returns any error encountered while
+trying to write to the connection.
 */
-func (conn Conn) Write(msg []byte) {
-	conn.writeCh <- msg
+func (conn *Conn) Write(msg []byte) (err error) {
+	select {
+	case err = <-conn.writeErrors:
+		return
+	default:
+		conn.writeCh <- msg
+		return
+	}
 }
 
 /*
 Read reads the next message to arrive on the connection.
+
+If the connection is autoRedial, Read will never return an error and instead
+simply block until we're able to read something.
+
+If the connection is not autoRedial, Read will return any error encountered
+while trying to read from the connection.
 */
-func (conn Conn) Read() (msg Message, err error) {
+func (conn *Conn) Read() (msg Message, err error) {
 	select {
 	case msg = <-conn.messages:
 		return
-	case err = <-conn.errors:
+	case err = <-conn.readErrors:
 		return
 	}
 }
@@ -146,70 +187,248 @@ func (conn Conn) Read() (msg Message, err error) {
 /*
 Close closes the connection.
 */
-func (conn Conn) Close() (err error) {
+func (conn *Conn) Close() (err error) {
 	switch orig := conn.orig.(type) {
 	case *net.Conn:
 		err = (*orig).Close()
 	case *tls.Conn:
 		err = orig.Close()
 	}
-	conn.closed = true
+	conn.stopReading()
+	conn.stopProcessing()
 	return
 }
 
 /*
-newConn creates a new connection and starts reading/writing to it.
+SetDeadline sets the read and write deadlines on the underlying connection.
 */
-func newConn(orig net.Conn) (conn Conn) {
-	conn = Conn{
-		stream:   framed.Framed{orig},
-		orig:     &orig,
-		writeCh:  make(chan []byte),
-		readCh:   make(chan []byte),
-		messages: make(chan Message),
-		errors:   make(chan error),
-		closed:   false,
+func (conn *Conn) SetDeadline(t time.Time) error {
+	switch orig := conn.orig.(type) {
+	case net.TCPConn:
+		return orig.SetDeadline(t)
+	case tls.Conn:
+		return orig.SetDeadline(t)
+	default:
+		return fmt.Errorf("Unable to SetDeadline on connection {}", orig)
+	}
+}
+
+/*
+SetReadDeadline sets the read deadline on the underlying connection.
+*/
+func (conn *Conn) SetReadDeadline(t time.Time) error {
+	switch orig := conn.orig.(type) {
+	case net.TCPConn:
+		return orig.SetReadDeadline(t)
+	case tls.Conn:
+		return orig.SetReadDeadline(t)
+	default:
+		return fmt.Errorf("Unable to SetReadDeadline on connection {}", orig)
+	}
+}
+
+/*
+SetWriteDeadline sets the write deadline on the underlying connection.
+*/
+func (conn *Conn) SetWriteDeadline(t time.Time) error {
+	switch orig := conn.orig.(type) {
+	case net.TCPConn:
+		return orig.SetWriteDeadline(t)
+	case tls.Conn:
+		return orig.SetWriteDeadline(t)
+	default:
+		return fmt.Errorf("Unable to SetWriteDeadline on connection {}", orig)
+	}
+}
+
+func newConn(addr string) (conn *Conn) {
+	return &Conn{
+		addr:        addr,
+		writeCh:     make(chan []byte, WRITE_QUEUE_DEPTH),
+		messages:    make(chan Message),
+		readErrors:  make(chan error),
+		writeErrors: make(chan error),
+		readError:   make(chan error),
+		readStream:  make(chan *framed.Framed),
+		stop:        make(chan interface{}),
+	}
+}
+
+/*
+dial dials the connection and returns any error encountered while doing so.
+*/
+func (conn *Conn) dial() (err error) {
+	var orig net.Conn
+	if conn.tlsConfig != nil {
+		orig, err = tls.Dial("tcp", conn.addr, conn.tlsConfig)
+	} else {
+		orig, err = net.Dial("tcp", conn.addr)
 	}
 
-	go conn.read()
-	go conn.process()
+	if err == nil {
+		conn.orig = &orig
+		conn.stream = &framed.Framed{orig}
+	}
 
 	return
 }
 
 /*
-Read on goroutine.  Doing our reads on a single goroutine ensures that length
-prefixes and their corresponding frames are read in the correct order.
+redial redials the connection.
+
+As long as dial() fails, redial increases the supplied backoff by a factor of 2
+and tries again.  If the time elapsed exceeds RETRY_TIMEOUT before dial
+succeeds, redial returns the most recent error from dial.
 */
-func (conn Conn) read() {
-	for conn.closed == false {
-		if frame, err := conn.stream.ReadFrame(); err != nil {
-			// TODO: catch EOF and try reconnecting
-			conn.errors <- err
+func (conn *Conn) redial(start time.Time, backoff time.Duration) (err error) {
+	for {
+		if time.Now().Sub(start) > RETRY_TIMEOUT {
+			// We're done trying to back off, just return the error
+			return
+		}
+		if backoff > 0 {
+			// Not our first try, wait a little
+			time.Sleep(backoff * time.Millisecond)
+		}
+		if err = conn.dial(); err == nil {
+			// Redial successful
+			return
 		} else {
-			conn.readCh <- frame
+			// Dial failed, bump up the backoff
+			if backoff == 0 {
+				backoff = BACKOFF_MS
+			} else {
+				backoff *= 2
+			}
 		}
 	}
 }
 
 /*
+run starts the goroutines for reading and processing the connection.
+*/
+func (conn *Conn) run() {
+	go conn.read(conn.stream)
+	go conn.process()
+}
+
+/*
+read reads from the given stream.  It is intended to run in a goroutine.  Doing
+our reads on a single goroutine ensures that length prefixes and their
+corresponding frames are read in the correct order.
+
+Reading is interrupted by sending a message to conn.readStream.  If the message
+is nil, reading simply stops.  If the message is a stream, then reading stops
+and a new goroutine is launched to read from the new stream.  This is used on
+autoRedial connections in which a write error triggered a redial.
+*/
+func (conn *Conn) read(stream *framed.Framed) {
+	for {
+		select {
+		case nextStream := <-conn.readStream:
+			if nextStream != nil {
+				go conn.read(nextStream)
+			}
+			return
+		default:
+			if frame, err := conn.stream.ReadFrame(); err != nil {
+				conn.readError <- err
+				return
+			} else {
+				var connectionState tls.ConnectionState
+				switch orig := conn.orig.(type) {
+				case *tls.Conn:
+					connectionState = orig.ConnectionState()
+				}
+				conn.messages <- Message{frame, connectionState}
+			}
+		}
+	}
+}
+
+/*
+restartReading restarts the reading go routine by sending the conn's new stream
+to the readStream channel.
+*/
+func (conn *Conn) restartReading() {
+	conn.readStream <- conn.stream
+}
+
+/*
+stopReading stops the reading go routine by sending a nil stream to the
+readStream channel.
+*/
+func (conn *Conn) stopReading() {
+	conn.readStream <- nil
+}
+
+/*
 Process requests to write and manage connection on a single goroutine.
 */
-func (conn Conn) process() {
-	for conn.closed == false {
+func (conn *Conn) process() {
+	for {
 		select {
+		case <-conn.stop:
+			return
+		case readError := <-conn.readError:
+			if conn.autoRedial {
+				if readError == io.EOF {
+					if redialErr := conn.redial(time.Now(), 0); redialErr == nil {
+						go conn.read(conn.stream)
+					} else {
+						conn.readErrors <- readError
+						return
+					}
+				}
+			} else {
+				conn.readErrors <- readError
+				return
+			}
 		case frame := <-conn.writeCh:
-			if err := conn.stream.WriteFrame(frame); err != nil {
-				// TODO: catch EOF and try reconnecting
-				conn.errors <- err
+			redialed, err := conn.writeFrame(frame)
+			if err != nil {
+				// Writing failed, stop processing
+				conn.stopReading()
+				conn.writeErrors <- err
+				return
+			} else if redialed {
+				// Redialing succeeded
+				conn.restartReading()
 			}
-		case frame := <-conn.readCh:
-			var connectionState tls.ConnectionState
-			switch orig := conn.orig.(type) {
-			case *tls.Conn:
-				connectionState = orig.ConnectionState()
+		}
+	}
+}
+
+/*
+stopProcessing stops processing by sending a message to the stop channel.
+*/
+func (conn *Conn) stopProcessing() {
+	conn.stop <- nil
+}
+
+/*
+writeFrame writes the frame to the connection.
+
+On an error, if the connection is not autoRedial, writeFrame reports the error
+and stops.
+
+If the connection is autoRedial and the writeFrame encounters EOF, writeFrame
+tries to redial().
+
+If redialing isn't attempted or doesn't work, an error is returned.
+*/
+func (conn *Conn) writeFrame(frame []byte) (redialed bool, err error) {
+	for {
+		var start = time.Now()
+		var backoff time.Duration
+		if err = conn.stream.WriteFrame(frame); err == nil {
+			return
+		} else {
+			if conn.autoRedial && err == io.EOF {
+				err = conn.redial(start, backoff)
+				redialed = true
+				return
 			}
-			conn.messages <- Message{frame, connectionState}
 		}
 	}
 }
