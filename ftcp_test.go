@@ -2,12 +2,19 @@ package ftcp
 
 import (
 	"fmt"
-	"os"
 	"testing"
 	"time"
 )
 
 func TestPlain(t *testing.T) {
+	doTest(t, false)
+}
+
+func TestRedialing(t *testing.T) {
+	doTest(t, true)
+}
+
+func doTest(t *testing.T, forceClose bool) {
 	var expectedOut = "Hello framed world"
 	var expectedIn = "Hello caller!"
 	var receivedOut string
@@ -30,7 +37,7 @@ func TestPlain(t *testing.T) {
 				errFromGoroutine = err
 				errFromGoroutine = fmt.Errorf("Unable to accept: %s", err)
 			} else {
-				if first {
+				if first && forceClose {
 					conn.Close()
 					first = false
 					continue
@@ -53,9 +60,11 @@ func TestPlain(t *testing.T) {
 			return
 		}
 		conn.Write([]byte(expectedOut))
-		// Wait and write again in case the original message got buffered but not delivered
-		time.Sleep(500 * time.Millisecond)
-		conn.Write([]byte(expectedOut))
+		if forceClose {
+			// Wait and write again in case the original message got buffered but not delivered
+			time.Sleep(500 * time.Millisecond)
+			conn.Write([]byte(expectedOut))
+		}
 		if msg, err := conn.Read(); err != nil {
 			errFromGoroutine = fmt.Errorf("Error reading response: %s", err)
 		} else {
@@ -74,6 +83,4 @@ func TestPlain(t *testing.T) {
 	if receivedIn != expectedIn {
 		t.Fatalf("Response payload did not match expected.  Expected '%s', Received '%s'", expectedIn, receivedIn)
 	}
-
-	os.Exit(0)
 }
