@@ -63,19 +63,19 @@ and from which one can receive Messages using Read().
 Multiple goroutines may invoke methods on a Conn simultaneously.
 */
 type Conn struct {
-	addr          string
-	redialTimeout time.Duration
-	tlsConfig     *tls.Config
-	autoRedial    bool
-	orig          interface{}
-	stream        *framed.Framed
-	writeCh       chan []byte
-	messages      chan Message
-	readErrors    chan error
-	writeErrors   chan error
-	readError     chan error
-	readStream    chan *framed.Framed
-	stop          chan interface{}
+	addr          string              // the host:port which the Conn will dial
+	redialTimeout time.Duration       // timeout for attempting redials
+	tlsConfig     *tls.Config         // (optional) TLS configuration for dialing
+	autoRedial    bool                // whether or not to auto-redial
+	orig          interface{}         // the original connection (net.Conn or tls.Conn)
+	stream        *framed.Framed      // framed version of orig
+	writeCh       chan []byte         // channel to which frames to be written are sent
+	messages      chan Message        // channel from which received frames are read
+	readErrors    chan error          // channel for reporting errors that happened while reading
+	writeErrors   chan error          // channel for reporting errors that happened while writing
+	readError     chan error          // channel for signaling to the process method that it needs to handle an error from the read method
+	nextStream    chan *framed.Framed // channel for telling the read goroutine about the next stream from which it should read (after redialing)
+	stop          chan interface{}    // channel for signaling to the process method that it should stop
 }
 
 /*
@@ -138,7 +138,7 @@ func ListenTLS(laddr string, config *tls.Config) (listener Listener, err error) 
 }
 
 /*
-Accept accepts a new connection on, similarly to net.Listener.Accept.
+Accept accepts a new connection, similarly to net.Listener.Accept.
 */
 func (listener *Listener) Accept() (conn *Conn, err error) {
 	var orig net.Conn
@@ -194,14 +194,18 @@ func (conn *Conn) Read() (msg Message, err error) {
 Close closes the connection.
 */
 func (conn *Conn) Close() (err error) {
+	// Stop the goroutines
+	conn.stopReading()
+	conn.stopProcessing()
+	
+	// Close the underlying connection
 	switch orig := conn.orig.(type) {
 	case *net.Conn:
 		err = (*orig).Close()
 	case *tls.Conn:
 		err = orig.Close()
 	}
-	conn.stopReading()
-	conn.stopProcessing()
+	
 	return
 }
 
@@ -247,6 +251,9 @@ func (conn *Conn) SetWriteDeadline(t time.Time) error {
 	}
 }
 
+/*
+newConn creates a new Conn with sensible defaults.
+*/
 func newConn(addr string) (conn *Conn) {
 	return &Conn{
 		addr:          addr,
@@ -256,7 +263,7 @@ func newConn(addr string) (conn *Conn) {
 		readErrors:    make(chan error),
 		writeErrors:   make(chan error),
 		readError:     make(chan error),
-		readStream:    make(chan *framed.Framed),
+		nextStream:    make(chan *framed.Framed),
 		stop:          make(chan interface{}),
 	}
 }
@@ -283,7 +290,7 @@ func (conn *Conn) dial() (err error) {
 /*
 redial redials the connection.
 
-As long as dial() fails, redial increases the supplied backoff by a factor of 2
+As long as dial fails, redial increases the supplied backoff by a factor of 2
 and tries again.  If the time elapsed exceeds RETRY_TIMEOUT before dial
 succeeds, redial returns the most recent error from dial.
 */
@@ -322,9 +329,10 @@ func (conn *Conn) run() {
 /*
 read reads from the given stream.  It is intended to run in a goroutine.  Doing
 our reads on a single goroutine ensures that length prefixes and their
-corresponding frames are read in the correct order.
+corresponding frames are read in the correct order, allowing Read to be called
+from multiple goroutines.
 
-Reading is interrupted by sending a message to conn.readStream.  If the message
+Reading is interrupted by sending a message to conn.nextStream.  If the message
 is nil, reading simply stops.  If the message is a stream, then reading stops
 and a new goroutine is launched to read from the new stream.  This is used on
 autoRedial connections in which a write error triggered a redial.
@@ -332,16 +340,18 @@ autoRedial connections in which a write error triggered a redial.
 func (conn *Conn) read(stream *framed.Framed) {
 	for {
 		select {
-		case nextStream := <-conn.readStream:
+		case nextStream := <-conn.nextStream:
 			if nextStream != nil {
 				go conn.read(nextStream)
 			}
 			return
 		default:
 			if frame, err := conn.stream.ReadFrame(); err != nil {
+				// Unable to read, report error for handling in process()
 				conn.readError <- err
 				return
 			} else {
+				// Read succeeded, report message
 				var connectionState tls.ConnectionState
 				switch orig := conn.orig.(type) {
 				case *tls.Conn:
@@ -355,22 +365,22 @@ func (conn *Conn) read(stream *framed.Framed) {
 
 /*
 restartReading restarts the reading go routine by sending the conn's new stream
-to the readStream channel.
+to the nextStream channel.
 */
 func (conn *Conn) restartReading() {
-	conn.readStream <- conn.stream
+	conn.nextStream <- conn.stream
 }
 
 /*
 stopReading stops the reading go routine by sending a nil stream to the
-readStream channel.
+nextStream channel.
 */
 func (conn *Conn) stopReading() {
-	conn.readStream <- nil
+	conn.nextStream <- nil
 }
 
 /*
-Process requests to write and manage connection on a single goroutine.
+process handles writes and error handling on a single goroutine.
 */
 func (conn *Conn) process() {
 	for {
@@ -383,11 +393,13 @@ func (conn *Conn) process() {
 					if redialErr := conn.redial(time.Now(), 0); redialErr == nil {
 						go conn.read(conn.stream)
 					} else {
+						// Unable to redial, just report the error and stop processing
 						conn.readErrors <- readError
 						return
 					}
 				}
 			} else {
+				// No autoRedial, just report the error and stop processing
 				conn.readErrors <- readError
 				return
 			}
@@ -399,7 +411,7 @@ func (conn *Conn) process() {
 				conn.writeErrors <- err
 				return
 			} else if redialed {
-				// Redialing succeeded
+				// Had to redial, restart reading on the new stream
 				conn.restartReading()
 			}
 		}
