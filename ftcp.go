@@ -34,6 +34,7 @@ package ftcp
 
 import (
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"github.com/oxtoacart/framed"
 	"io"
@@ -47,11 +48,22 @@ const (
 	DEFAULT_REDIAL_TIMEOUT    = 60000
 )
 
+var (
+	ErrTimeout = fmt.Errorf("Operation timed out")
+)
+
+type MessageID uint64
+
 /*
-Message encapsulates a message received from an ftcp connection, including both
-the data (payload) of the message and, if using TLS, the tls.ConnectionState.
+Message encapsulates a message received from an ftcp connection, including an
+id, the data (payload) of the message and, if received via TLS, the
+tls.ConnectionState.
+
+If left unspecified, the ID is auto-assigned based on a sequential number.
 */
 type Message struct {
+	ID       MessageID // The ID of this message
+	RepID    MessageID // The ID of the message to which this message is replying
 	Data     []byte
 	TLSState tls.ConnectionState
 }
@@ -69,13 +81,14 @@ type Conn struct {
 	autoRedial    bool                // whether or not to auto-redial
 	orig          interface{}         // the original connection (net.Conn or tls.Conn)
 	stream        *framed.Framed      // framed version of orig
-	writeCh       chan []byte         // channel to which frames to be written are sent
+	writeCh       chan Message        // channel to which messages to be written are sent
 	messages      chan Message        // channel from which received frames are read
 	readErrors    chan error          // channel for reporting errors that happened while reading
 	writeErrors   chan error          // channel for reporting errors that happened while writing
 	readError     chan error          // channel for signaling to the process method that it needs to handle an error from the read method
 	nextStream    chan *framed.Framed // channel for telling the read goroutine about the next stream from which it should read (after redialing)
 	stop          chan interface{}    // channel for signaling to the process method that it should stop
+	idSeq         uint64              // sequence number for assigning IDs to messages
 }
 
 /*
@@ -152,7 +165,7 @@ func (listener *Listener) Accept() (conn *Conn, err error) {
 }
 
 /*
-Write requests a write of the given message frame to the connection.
+Write requests a write of the given message to the connection.
 
 If the connection is autoRedial, this write will be queued for delivery after
 redial can be successfully completed.  If the number of queued messages equals
@@ -162,7 +175,7 @@ again.
 If the connection is not autoRedial, Write returns any error encountered while
 trying to write to the connection.
 */
-func (conn *Conn) Write(msg []byte) (err error) {
+func (conn *Conn) Write(msg Message) (err error) {
 	select {
 	case err = <-conn.writeErrors:
 		return
@@ -191,13 +204,48 @@ func (conn *Conn) Read() (msg Message, err error) {
 }
 
 /*
+Req implements blocking request/reply semantics on top of a Conn.
+*/
+func (conn *Conn) Req(req Message, timeoutInMillis time.Duration) (rep Message, err error) {
+	repCh := make(chan Message)
+	errCh := make(chan error)
+
+	// Read the reply
+	go func() {
+		for {
+			if rep, err := conn.Read(); err != nil {
+				errCh <- err
+				return
+			} else {
+				if rep.ID == req.ID {
+					repCh <- rep
+				}
+				return
+			}
+		}
+	}()
+
+	// Send the request
+	conn.Write(req)
+
+	select {
+	case rep = <-repCh:
+	case err = <-errCh:
+	case <-time.After(timeoutInMillis * time.Millisecond):
+		err = ErrTimeout
+	}
+
+	return
+}
+
+/*
 Close closes the connection.
 */
 func (conn *Conn) Close() (err error) {
 	// Stop the goroutines
 	conn.stopReading()
 	conn.stopProcessing()
-	
+
 	// Close the underlying connection
 	switch orig := conn.orig.(type) {
 	case *net.Conn:
@@ -205,7 +253,7 @@ func (conn *Conn) Close() (err error) {
 	case *tls.Conn:
 		err = orig.Close()
 	}
-	
+
 	return
 }
 
@@ -258,7 +306,7 @@ func newConn(addr string) (conn *Conn) {
 	return &Conn{
 		addr:          addr,
 		redialTimeout: DEFAULT_REDIAL_TIMEOUT,
-		writeCh:       make(chan []byte, DEFAULT_WRITE_QUEUE_DEPTH),
+		writeCh:       make(chan Message, DEFAULT_WRITE_QUEUE_DEPTH),
 		messages:      make(chan Message),
 		readErrors:    make(chan error),
 		writeErrors:   make(chan error),
@@ -352,12 +400,25 @@ func (conn *Conn) read(stream *framed.Framed) {
 				return
 			} else {
 				// Read succeeded, report message
-				var connectionState tls.ConnectionState
-				switch orig := conn.orig.(type) {
-				case *tls.Conn:
-					connectionState = orig.ConnectionState()
+				idBytes := frame[0:8]
+				repIdBytes := frame[8:16]
+				data := frame[16:]
+				id, n := binary.Uvarint(idBytes)
+				if n <= 0 {
+					conn.readError <- fmt.Errorf("Unable to decode ID bytes")
+				} else {
+					repId, n := binary.Uvarint(repIdBytes)
+					if n <= 0 {
+						conn.readError <- fmt.Errorf("Unable to decode RepID bytes")
+					} else {
+						var connectionState tls.ConnectionState
+						switch orig := conn.orig.(type) {
+						case *tls.Conn:
+							connectionState = orig.ConnectionState()
+						}
+						conn.messages <- Message{MessageID(id), MessageID(repId), data, connectionState}
+					}
 				}
-				conn.messages <- Message{frame, connectionState}
 			}
 		}
 	}
@@ -403,16 +464,31 @@ func (conn *Conn) process() {
 				conn.readErrors <- readError
 				return
 			}
-		case frame := <-conn.writeCh:
-			redialed, err := conn.writeFrame(frame)
-			if err != nil {
-				// Writing failed, stop processing
-				conn.stopReading()
-				conn.writeErrors <- err
-				return
-			} else if redialed {
-				// Had to redial, restart reading on the new stream
-				conn.restartReading()
+		case msg := <-conn.writeCh:
+			idBytes := make([]byte, 8)
+			repIdBytes := make([]byte, 8)
+			id := msg.ID
+			if id == 0 {
+				conn.idSeq += 1
+				id = MessageID(conn.idSeq)
+			}
+			if n := binary.PutUvarint(idBytes, uint64(id)); n <= 0 {
+				conn.writeErrors <- fmt.Errorf("Unable to encode ID bytes!")
+			} else {
+				if n := binary.PutUvarint(repIdBytes, uint64(msg.RepID)); n <= 0 {
+					conn.writeErrors <- fmt.Errorf("Unable to encode RepID bytes!")
+				} else {
+					redialed, err := conn.writeFrame(idBytes, repIdBytes, msg.Data)
+					if err != nil {
+						// Writing failed, stop processing
+						conn.stopReading()
+						conn.writeErrors <- err
+						return
+					} else if redialed {
+						// Had to redial, restart reading on the new stream
+						conn.restartReading()
+					}
+				}
 			}
 		}
 	}
@@ -436,11 +512,11 @@ tries to redial().
 
 If redialing isn't attempted or doesn't work, an error is returned.
 */
-func (conn *Conn) writeFrame(frame []byte) (redialed bool, err error) {
+func (conn *Conn) writeFrame(byteArrays ...[]byte) (redialed bool, err error) {
 	for {
 		var start = time.Now()
 		var backoff time.Duration
-		if err = conn.stream.WriteFrame(frame); err == nil {
+		if err = conn.stream.WriteFrame(byteArrays...); err == nil {
 			return
 		} else {
 			if conn.autoRedial && err == io.EOF {

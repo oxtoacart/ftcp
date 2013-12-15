@@ -16,9 +16,10 @@ func TestWithClose(t *testing.T) {
 
 func doTest(t *testing.T, forceClose bool) {
 	var expectedOut = "Hello framed world"
+	var expectedId = MessageID(59)
 	var expectedIn = "Hello caller!"
-	var receivedOut string
-	var receivedIn string
+	var receivedOut Message
+	var receivedIn Message
 	var errFromGoroutine error
 
 	listener, err := Listen("127.0.0.1:0")
@@ -34,7 +35,6 @@ func doTest(t *testing.T, forceClose bool) {
 		for {
 			conn, err := listener.Accept()
 			if err != nil {
-				errFromGoroutine = err
 				errFromGoroutine = fmt.Errorf("Unable to accept: %s", err)
 			} else {
 				if first && forceClose {
@@ -43,8 +43,10 @@ func doTest(t *testing.T, forceClose bool) {
 					continue
 				}
 				if msg, err := conn.Read(); err == nil {
-					receivedOut = string(msg.Data)
-					conn.Write([]byte(expectedIn))
+					receivedOut = msg
+					if err := conn.Write(Message{RepID: msg.ID, Data: []byte(expectedIn)}); err != nil {
+						errFromGoroutine = err
+					}
 				}
 				return
 			}
@@ -59,16 +61,20 @@ func doTest(t *testing.T, forceClose bool) {
 			errFromGoroutine = fmt.Errorf("Unable to dial address: %s %s", addr, err)
 			return
 		}
-		conn.Write([]byte(expectedOut))
+		msgOut := Message{ID: expectedId, Data: []byte(expectedOut)}
+		if err := conn.Write(msgOut); err != nil {
+			errFromGoroutine = err
+			return
+		}
 		if forceClose {
 			// Wait and write again in case the original message got buffered but not delivered
 			time.Sleep(500 * time.Millisecond)
-			conn.Write([]byte(expectedOut))
+			conn.Write(msgOut)
 		}
-		if msg, err := conn.Read(); err != nil {
+		if msgIn, err := conn.Read(); err != nil {
 			errFromGoroutine = fmt.Errorf("Error reading response: %s", err)
 		} else {
-			receivedIn = string(msg.Data)
+			receivedIn = msgIn
 		}
 	}()
 
@@ -76,11 +82,16 @@ func doTest(t *testing.T, forceClose bool) {
 	if errFromGoroutine != nil {
 		t.Fatal(errFromGoroutine)
 	}
-	if receivedOut != expectedOut {
-		t.Fatalf("Sent payload did not match expected.  Expected '%s', Received '%s'", expectedOut, receivedOut)
+	if string(receivedOut.Data) != expectedOut {
+		t.Fatalf("Sent payload did not match expected.  Expected '%s', Received '%s'", expectedOut, string(receivedOut.Data))
 	}
-
-	if receivedIn != expectedIn {
-		t.Fatalf("Response payload did not match expected.  Expected '%s', Received '%s'", expectedIn, receivedIn)
+	if receivedOut.ID != expectedId {
+		t.Fatalf("Sent ID did not match expected.  Expected '%s', Received '%s'", expectedId, receivedOut.ID)
+	}
+	if string(receivedIn.Data) != expectedIn {
+		t.Fatalf("Response payload did not match expected.  Expected '%s', Received '%s'", expectedIn, string(receivedIn.Data))
+	}
+	if receivedIn.RepID != expectedId {
+		t.Fatalf("Response RepID did not match expected.  Expected '%s', Received '%s'", expectedId, receivedIn.RepID)
 	}
 }
