@@ -68,7 +68,7 @@ func doTest(t *testing.T, forceClose bool) {
 		}
 		if forceClose {
 			// Wait and write again in case the original message got buffered but not delivered
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 			conn.Write(msgOut)
 		}
 		if msgIn, err := conn.Read(); err != nil {
@@ -78,7 +78,7 @@ func doTest(t *testing.T, forceClose bool) {
 		}
 	}()
 
-	time.Sleep(1000 * time.Millisecond)
+	time.Sleep(500 * time.Millisecond)
 	if errFromGoroutine != nil {
 		t.Fatal(errFromGoroutine)
 	}
