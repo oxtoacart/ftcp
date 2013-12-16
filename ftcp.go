@@ -471,7 +471,7 @@ func (conn *Conn) process() {
 		case reader := <-conn.removeReader:
 			conn.handleRemoveReader(reader)
 		case msg := <-conn.out:
-			conn.handleRecvdMsg(msg)
+			conn.handleWrite(msg)
 		case frame := <-conn.frameRead:
 			conn.handleFrameRead(frame)
 		case readError := <-conn.readError:
@@ -536,7 +536,7 @@ func (conn *Conn) handleReadError(readError error) {
 	}
 }
 
-func (conn *Conn) handleRecvdMsg(msg Message) {
+func (conn *Conn) handleWrite(msg Message) {
 	idBytes := make([]byte, 8)
 	repIdBytes := make([]byte, 8)
 	if msg.ID == 0 {
