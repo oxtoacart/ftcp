@@ -20,6 +20,7 @@ func doTest(t *testing.T, forceClose bool) {
 	var expectedIn = "Hello caller!"
 	var receivedOut Message
 	var receivedIn Message
+	var receivedIn2 Message
 	var errFromGoroutine error
 
 	listener, err := Listen("127.0.0.1:0")
@@ -42,9 +43,12 @@ func doTest(t *testing.T, forceClose bool) {
 					first = false
 					continue
 				}
-				if msg, err := conn.Read(); err == nil {
+				reader := conn.Reader()
+				//defer reader.Close()
+				if msg, err := reader.Read(); err == nil {
 					receivedOut = msg
-					if err := conn.Write(Message{RepID: msg.ID, Data: []byte(expectedIn)}); err != nil {
+					msgOut := Message{RepID: msg.ID, Data: []byte(expectedIn)}
+					if err := conn.Write(msgOut); err != nil {
 						errFromGoroutine = err
 					}
 				}
@@ -56,29 +60,40 @@ func doTest(t *testing.T, forceClose bool) {
 	// Write message
 	go func() {
 		conn, err := Dial(addr)
+		if err != nil {
+			errFromGoroutine = err
+			return
+		}
 		defer conn.Close()
 		if err != nil {
 			errFromGoroutine = fmt.Errorf("Unable to dial address: %s %s", addr, err)
 			return
 		}
 		msgOut := Message{ID: expectedId, Data: []byte(expectedOut)}
-		if err := conn.Write(msgOut); err != nil {
-			errFromGoroutine = err
-			return
-		}
+
+		// Read using a reader on one Goroutine
+		go func() {
+			reader := conn.Reader()
+			//defer reader.Close()
+			if msgIn2, err := reader.Read(); err != nil {
+				errFromGoroutine = fmt.Errorf("Error reading response with Reader: %s", err)
+			} else {
+				receivedIn2 = msgIn2
+			}
+		}()
+
+		time.Sleep(100 * time.Millisecond)
+		// Send a request/reply message
+		receivedIn, err = conn.Req(msgOut, 500 * time.Millisecond)
+
 		if forceClose {
 			// Wait and write again in case the original message got buffered but not delivered
 			time.Sleep(200 * time.Millisecond)
 			conn.Write(msgOut)
 		}
-		if msgIn, err := conn.Read(); err != nil {
-			errFromGoroutine = fmt.Errorf("Error reading response: %s", err)
-		} else {
-			receivedIn = msgIn
-		}
 	}()
 
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 	if errFromGoroutine != nil {
 		t.Fatal(errFromGoroutine)
 	}
@@ -88,10 +103,13 @@ func doTest(t *testing.T, forceClose bool) {
 	if receivedOut.ID != expectedId {
 		t.Fatalf("Sent ID did not match expected.  Expected '%s', Received '%s'", expectedId, receivedOut.ID)
 	}
-	if string(receivedIn.Data) != expectedIn {
-		t.Fatalf("Response payload did not match expected.  Expected '%s', Received '%s'", expectedIn, string(receivedIn.Data))
+	for i, recvd := range []Message{receivedIn, receivedIn2} {
+		if string(recvd.Data) != expectedIn {
+			t.Fatalf("Response payload %d did not match expected.  Expected '%s', Received '%s'", i, expectedIn, string(recvd.Data))
+		}
+		if recvd.RepID != expectedId {
+			t.Fatalf("Response RepID %d did not match expected.  Expected '%s', Received '%s'", i, expectedId, recvd.RepID)
+		}
 	}
-	if receivedIn.RepID != expectedId {
-		t.Fatalf("Response RepID did not match expected.  Expected '%s', Received '%s'", expectedId, receivedIn.RepID)
-	}
+
 }

@@ -10,6 +10,14 @@ they encounter an error.  If the redial can't successfully complete within
 DEFAULT_REDIAL_TIMEOUT milliseconds, then the connection gives up and returns an
 error.
 
+One writes to connections directly using Conn.Write().
+
+One reads from connections by obtaining a Reader from Conn.Reader() and then
+using Reader.Read().  Make sure to close Readers using the Close() function
+after you're done reading, otherwise other Readers will block!
+
+One can also use synchronous request/reply semantics with Conn.Req().
+
 Example:
 
 	package main
@@ -17,15 +25,28 @@ Example:
 	import (
 		"github.com/oxtoacart/ftcp"
 		"log"
+		"time"
 	)
 
 	func main() {
 		// Replace host:port with an actual TCP server, for example the echo service
 		if conn, err := ftcp.Dial("host:port"); err == nil {
-			if err := framedConn.Write([]byte("Hello World")); err == nil {
-				if msg, err := framedConn.Read(); err == nil {
-					log.Println("We're done!")
+			// Construct a Message to send
+			msg := Message{Data: []byte("Hello World")}
+			
+			// Write directly on the Conn
+			if err := framedConn.Write(msg); err == nil {
+				// Read using a Reader
+				reader := framedConn.Reader()
+				defer reader.Close()
+				if msg, err := reader.Read(); err == nil {
+					log.Println("Received message: {}", msg)
 				}
+			}
+			
+			// Alternately, use request/reply semantics
+			if repMsg, err := framedConn.Req(msg, 500 * time.Millisecond); err == nil {
+				log.Println("Received reply: {}", repMsg)
 			}
 		}
 	}
@@ -81,9 +102,11 @@ type Conn struct {
 	autoRedial    bool                // whether or not to auto-redial
 	orig          interface{}         // the original connection (net.Conn or tls.Conn)
 	stream        *framed.Framed      // framed version of orig
-	writeCh       chan Message        // channel to which messages to be written are sent
-	messages      chan Message        // channel from which received frames are read
-	readErrors    chan error          // channel for reporting errors that happened while reading
+	readers       []*Reader           // readers reading from this Connection (there is always at least 1, the default reader)
+	frameRead     chan []byte         // channel for frame that was read
+	addReader     chan *Reader        // channel for requests to add readers
+	removeReader  chan *Reader        // channel for requests to remove readers
+	out           chan Message        // channel to which messages to be written are sent
 	writeErrors   chan error          // channel for reporting errors that happened while writing
 	readError     chan error          // channel for signaling to the process method that it needs to handle an error from the read method
 	nextStream    chan *framed.Framed // channel for telling the read goroutine about the next stream from which it should read (after redialing)
@@ -180,44 +203,51 @@ func (conn *Conn) Write(msg Message) (err error) {
 	case err = <-conn.writeErrors:
 		return
 	default:
-		conn.writeCh <- msg
+		conn.out <- msg
 		return
 	}
 }
 
 /*
-Read reads the next message to arrive on the connection.
+Creates a new Reader on the given conn.  A Reader allows multiple goroutines to
+read from the same Conn in parallel.
 
-If the connection is autoRedial, Read will never return an error and instead
-simply block until we're able to read something.
-
-If the connection is not autoRedial, Read will return any error encountered
-while trying to read from the connection.
+IMPORTANT - Once you have opened a Reader, you need to Read() from it to drain
+incoming messages on the Conn, otherwise it will block other Readers.  When
+finished reading, close the reader with Close().
 */
-func (conn *Conn) Read() (msg Message, err error) {
-	select {
-	case msg = <-conn.messages:
-		return
-	case err = <-conn.readErrors:
-		return
+func (conn *Conn) Reader() (reader *Reader) {
+	reader = &Reader{
+		conn:       conn,
+		in:         make(chan Message),
+		readErrors: make(chan error),
+		added:      make(chan bool),
+		removed:    make(chan bool),
 	}
+	// Request Reader to be added to Conn
+	conn.addReader <- reader
+	// Wait for Reader to be added to Conn
+	<-reader.added
+	return
 }
 
 /*
 Req implements blocking request/reply semantics on top of a Conn.
 */
-func (conn *Conn) Req(req Message, timeoutInMillis time.Duration) (rep Message, err error) {
+func (conn *Conn) Req(req Message, timeout time.Duration) (rep Message, err error) {
 	repCh := make(chan Message)
 	errCh := make(chan error)
+	reader := conn.Reader()
+	defer reader.Close()
 
 	// Read the reply
 	go func() {
 		for {
-			if rep, err := conn.Read(); err != nil {
+			if rep, err := reader.Read(); err != nil {
 				errCh <- err
 				return
 			} else {
-				if rep.ID == req.ID {
+				if rep.RepID == req.ID {
 					repCh <- rep
 				}
 				return
@@ -230,9 +260,12 @@ func (conn *Conn) Req(req Message, timeoutInMillis time.Duration) (rep Message, 
 
 	select {
 	case rep = <-repCh:
+		return rep, nil
 	case err = <-errCh:
-	case <-time.After(timeoutInMillis * time.Millisecond):
+		return
+	case <-time.After(timeout):
 		err = ErrTimeout
+		return
 	}
 
 	return
@@ -303,17 +336,19 @@ func (conn *Conn) SetWriteDeadline(t time.Time) error {
 newConn creates a new Conn with sensible defaults.
 */
 func newConn(addr string) (conn *Conn) {
-	return &Conn{
+	conn = &Conn{
 		addr:          addr,
 		redialTimeout: DEFAULT_REDIAL_TIMEOUT,
-		writeCh:       make(chan Message, DEFAULT_WRITE_QUEUE_DEPTH),
-		messages:      make(chan Message),
-		readErrors:    make(chan error),
+		frameRead:     make(chan []byte),
+		addReader:     make(chan *Reader, 100),
+		removeReader:  make(chan *Reader, 100),
+		out:           make(chan Message, DEFAULT_WRITE_QUEUE_DEPTH),
 		writeErrors:   make(chan error),
 		readError:     make(chan error),
 		nextStream:    make(chan *framed.Framed),
 		stop:          make(chan interface{}),
 	}
+	return conn
 }
 
 /*
@@ -399,26 +434,8 @@ func (conn *Conn) read(stream *framed.Framed) {
 				conn.readError <- err
 				return
 			} else {
-				// Read succeeded, report message
-				idBytes := frame[0:8]
-				repIdBytes := frame[8:16]
-				data := frame[16:]
-				id, n := binary.Uvarint(idBytes)
-				if n <= 0 {
-					conn.readError <- fmt.Errorf("Unable to decode ID bytes")
-				} else {
-					repId, n := binary.Uvarint(repIdBytes)
-					if n <= 0 {
-						conn.readError <- fmt.Errorf("Unable to decode RepID bytes")
-					} else {
-						var connectionState tls.ConnectionState
-						switch orig := conn.orig.(type) {
-						case *tls.Conn:
-							connectionState = orig.ConnectionState()
-						}
-						conn.messages <- Message{MessageID(id), MessageID(repId), data, connectionState}
-					}
-				}
+				// Read succeeded, report frame
+				conn.frameRead <- frame
 			}
 		}
 	}
@@ -441,55 +458,24 @@ func (conn *Conn) stopReading() {
 }
 
 /*
-process handles writes and error handling on a single goroutine.
+process is our traffic cop - anything requiring synchronization goes through
+here.
 */
 func (conn *Conn) process() {
 	for {
 		select {
 		case <-conn.stop:
 			return
+		case reader := <-conn.addReader:
+			conn.handleAddReader(reader)
+		case reader := <-conn.removeReader:
+			conn.handleRemoveReader(reader)
+		case msg := <-conn.out:
+			conn.handleRecvdMsg(msg)
+		case frame := <-conn.frameRead:
+			conn.handleFrameRead(frame)
 		case readError := <-conn.readError:
-			if conn.autoRedial {
-				if readError == io.EOF {
-					if redialErr := conn.redial(time.Now(), 0); redialErr == nil {
-						go conn.read(conn.stream)
-					} else {
-						// Unable to redial, just report the error and stop processing
-						conn.readErrors <- readError
-						return
-					}
-				}
-			} else {
-				// No autoRedial, just report the error and stop processing
-				conn.readErrors <- readError
-				return
-			}
-		case msg := <-conn.writeCh:
-			idBytes := make([]byte, 8)
-			repIdBytes := make([]byte, 8)
-			id := msg.ID
-			if id == 0 {
-				conn.idSeq += 1
-				id = MessageID(conn.idSeq)
-			}
-			if n := binary.PutUvarint(idBytes, uint64(id)); n <= 0 {
-				conn.writeErrors <- fmt.Errorf("Unable to encode ID bytes!")
-			} else {
-				if n := binary.PutUvarint(repIdBytes, uint64(msg.RepID)); n <= 0 {
-					conn.writeErrors <- fmt.Errorf("Unable to encode RepID bytes!")
-				} else {
-					redialed, err := conn.writeFrame(idBytes, repIdBytes, msg.Data)
-					if err != nil {
-						// Writing failed, stop processing
-						conn.stopReading()
-						conn.writeErrors <- err
-						return
-					} else if redialed {
-						// Had to redial, restart reading on the new stream
-						conn.restartReading()
-					}
-				}
-			}
+			conn.handleReadError(readError)
 		}
 	}
 }
@@ -523,6 +509,102 @@ func (conn *Conn) writeFrame(byteArrays ...[]byte) (redialed bool, err error) {
 				err = conn.redial(start, backoff)
 				redialed = true
 				return
+			}
+		}
+	}
+}
+
+func (conn *Conn) handleReadError(readError error) {
+	if conn.autoRedial {
+		if readError == io.EOF {
+			if redialErr := conn.redial(time.Now(), 0); redialErr == nil {
+				go conn.read(conn.stream)
+			} else {
+				// Unable to redial, just report the error and stop processing
+				for _, reader := range conn.readers {
+					reader.readErrors <- readError
+				}
+				return
+			}
+		}
+	} else {
+		// No autoRedial, just report the error and stop processing
+		for _, reader := range conn.readers {
+			reader.readErrors <- readError
+		}
+		return
+	}
+}
+
+func (conn *Conn) handleRecvdMsg(msg Message) {
+	idBytes := make([]byte, 8)
+	repIdBytes := make([]byte, 8)
+	if msg.ID == 0 {
+		conn.idSeq += 1
+		msg.ID = MessageID(conn.idSeq)
+	}
+	if n := binary.PutUvarint(idBytes, uint64(msg.ID)); n <= 0 {
+		conn.writeErrors <- fmt.Errorf("Unable to encode ID bytes!")
+	} else {
+		if n := binary.PutUvarint(repIdBytes, uint64(msg.RepID)); n <= 0 {
+			conn.writeErrors <- fmt.Errorf("Unable to encode RepID bytes!")
+		} else {
+			redialed, err := conn.writeFrame(idBytes, repIdBytes, msg.Data)
+			if err != nil {
+				// Writing failed, stop processing
+				conn.stopReading()
+				conn.writeErrors <- err
+				return
+			} else if redialed {
+				// Had to redial, restart reading on the new stream
+				conn.restartReading()
+			}
+		}
+	}
+}
+
+/*
+handleAddReader adds a reader to this Conn.
+*/
+func (conn *Conn) handleAddReader(reader *Reader) {
+	conn.readers = append(conn.readers, reader)
+	reader.added <- true
+}
+
+/*
+handleRemoveReader removes the given Reader from this connection.
+*/
+func (conn *Conn) handleRemoveReader(reader *Reader) {
+	for i, existing := range conn.readers {
+		if reader == existing {
+			conn.readers = append(conn.readers[:i], conn.readers[i+1:]...)
+			return
+		}
+	}
+}
+
+/*
+handleFrameRead turns a frame into a Message and reports it.
+*/
+func (conn *Conn) handleFrameRead(frame []byte) {
+	idBytes := frame[0:8]
+	repIdBytes := frame[8:16]
+	data := frame[16:]
+	id, n := binary.Uvarint(idBytes)
+	if n <= 0 {
+		conn.readError <- fmt.Errorf("Unable to decode ID bytes")
+	} else {
+		repId, n := binary.Uvarint(repIdBytes)
+		if n <= 0 {
+			conn.readError <- fmt.Errorf("Unable to decode RepID bytes")
+		} else {
+			var connectionState tls.ConnectionState
+			switch orig := conn.orig.(type) {
+			case *tls.Conn:
+				connectionState = orig.ConnectionState()
+			}
+			for _, reader := range conn.readers {
+				reader.in <- Message{MessageID(id), MessageID(repId), data, connectionState}
 			}
 		}
 	}
