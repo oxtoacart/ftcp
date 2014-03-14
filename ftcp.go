@@ -476,7 +476,13 @@ func (conn *Conn) process() {
 		case frame := <-conn.frameRead:
 			conn.handleFrameRead(frame)
 		case readError := <-conn.readError:
-			conn.handleReadError(readError)
+			if !conn.redialIfPossible(readError) {
+				// Didn't redial, just report the error and stop processing
+				for _, reader := range conn.readers {
+					reader.readErrors <- readError
+				}
+				return
+			}
 		}
 	}
 }
@@ -515,26 +521,17 @@ func (conn *Conn) writeFrame(byteArrays ...[]byte) (redialed bool, err error) {
 	}
 }
 
-func (conn *Conn) handleReadError(readError error) {
+func (conn *Conn) redialIfPossible(readError error) (redialed bool) {
 	if conn.autoRedial {
 		if readError == io.EOF {
 			if redialErr := conn.redial(time.Now(), 0); redialErr == nil {
 				go conn.read(conn.stream)
-			} else {
-				// Unable to redial, just report the error and stop processing
-				for _, reader := range conn.readers {
-					reader.readErrors <- readError
-				}
-				return
+				return true
 			}
 		}
-	} else {
-		// No autoRedial, just report the error and stop processing
-		for _, reader := range conn.readers {
-			reader.readErrors <- readError
-		}
-		return
 	}
+
+	return false
 }
 
 func (conn *Conn) handleWrite(msg *Message) {

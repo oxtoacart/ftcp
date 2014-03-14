@@ -85,12 +85,6 @@ func doTest(t *testing.T, forceClose bool) {
 		time.Sleep(100 * time.Millisecond)
 		// Send a request/reply message
 		receivedIn, err = conn.Req(msgOut, 500*time.Millisecond)
-
-		if forceClose {
-			// Wait and write again in case the original message got buffered but not delivered
-			time.Sleep(200 * time.Millisecond)
-			conn.Write(msgOut)
-		}
 	}()
 
 	time.Sleep(250 * time.Millisecond)
