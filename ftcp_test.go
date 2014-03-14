@@ -18,9 +18,9 @@ func doTest(t *testing.T, forceClose bool) {
 	var expectedOut = "Hello framed world"
 	var expectedId = MessageID(59)
 	var expectedIn = "Hello caller!"
-	var receivedOut Message
-	var receivedIn Message
-	var receivedIn2 Message
+	var receivedOut *Message
+	var receivedIn *Message
+	var receivedIn2 *Message
 	var errFromGoroutine error
 
 	listener, err := Listen("127.0.0.1:0")
@@ -44,10 +44,10 @@ func doTest(t *testing.T, forceClose bool) {
 					continue
 				}
 				reader := conn.Reader()
-				//defer reader.Close()
+				defer reader.Close()
 				if msg, err := reader.Read(); err == nil {
 					receivedOut = msg
-					msgOut := Message{RepID: msg.ID, Data: []byte(expectedIn)}
+					msgOut := &Message{RepID: msg.ID, Data: []byte(expectedIn)}
 					if err := conn.Write(msgOut); err != nil {
 						errFromGoroutine = err
 					}
@@ -69,12 +69,12 @@ func doTest(t *testing.T, forceClose bool) {
 			errFromGoroutine = fmt.Errorf("Unable to dial address: %s %s", addr, err)
 			return
 		}
-		msgOut := Message{ID: expectedId, Data: []byte(expectedOut)}
+		msgOut := &Message{ID: expectedId, Data: []byte(expectedOut)}
 
 		// Read using a reader on one Goroutine
 		go func() {
 			reader := conn.Reader()
-			//defer reader.Close()
+			defer reader.Close()
 			if msgIn2, err := reader.Read(); err != nil {
 				errFromGoroutine = fmt.Errorf("Error reading response with Reader: %s", err)
 			} else {
@@ -84,7 +84,7 @@ func doTest(t *testing.T, forceClose bool) {
 
 		time.Sleep(100 * time.Millisecond)
 		// Send a request/reply message
-		receivedIn, err = conn.Req(msgOut, 500 * time.Millisecond)
+		receivedIn, err = conn.Req(msgOut, 500*time.Millisecond)
 
 		if forceClose {
 			// Wait and write again in case the original message got buffered but not delivered
@@ -103,7 +103,7 @@ func doTest(t *testing.T, forceClose bool) {
 	if receivedOut.ID != expectedId {
 		t.Fatalf("Sent ID did not match expected.  Expected '%s', Received '%s'", expectedId, receivedOut.ID)
 	}
-	for i, recvd := range []Message{receivedIn, receivedIn2} {
+	for i, recvd := range []*Message{receivedIn, receivedIn2} {
 		if string(recvd.Data) != expectedIn {
 			t.Fatalf("Response payload %d did not match expected.  Expected '%s', Received '%s'", i, expectedIn, string(recvd.Data))
 		}

@@ -32,8 +32,8 @@ Example:
 		// Replace host:port with an actual TCP server, for example the echo service
 		if conn, err := ftcp.Dial("host:port"); err == nil {
 			// Construct a Message to send
-			msg := Message{Data: []byte("Hello World")}
-			
+			msg := &Message{Data: []byte("Hello World")}
+
 			// Write directly on the Conn
 			if err := framedConn.Write(msg); err == nil {
 				// Read using a Reader
@@ -43,7 +43,7 @@ Example:
 					log.Println("Received message: {}", msg)
 				}
 			}
-			
+
 			// Alternately, use request/reply semantics
 			if repMsg, err := framedConn.Req(msg, 500 * time.Millisecond); err == nil {
 				log.Println("Received reply: {}", repMsg)
@@ -106,7 +106,7 @@ type Conn struct {
 	frameRead     chan []byte         // channel for frame that was read
 	addReader     chan *Reader        // channel for requests to add readers
 	removeReader  chan *Reader        // channel for requests to remove readers
-	out           chan Message        // channel to which messages to be written are sent
+	out           chan *Message       // channel to which messages to be written are sent
 	writeErrors   chan error          // channel for reporting errors that happened while writing
 	readError     chan error          // channel for signaling to the process method that it needs to handle an error from the read method
 	nextStream    chan *framed.Framed // channel for telling the read goroutine about the next stream from which it should read (after redialing)
@@ -198,7 +198,7 @@ again.
 If the connection is not autoRedial, Write returns any error encountered while
 trying to write to the connection.
 */
-func (conn *Conn) Write(msg Message) (err error) {
+func (conn *Conn) Write(msg *Message) (err error) {
 	select {
 	case err = <-conn.writeErrors:
 		return
@@ -219,7 +219,7 @@ finished reading, close the reader with Close().
 func (conn *Conn) Reader() (reader *Reader) {
 	reader = &Reader{
 		conn:       conn,
-		in:         make(chan Message),
+		in:         make(chan *Message),
 		readErrors: make(chan error),
 		added:      make(chan bool),
 		removed:    make(chan bool),
@@ -234,8 +234,8 @@ func (conn *Conn) Reader() (reader *Reader) {
 /*
 Req implements blocking request/reply semantics on top of a Conn.
 */
-func (conn *Conn) Req(req Message, timeout time.Duration) (rep Message, err error) {
-	repCh := make(chan Message)
+func (conn *Conn) Req(req *Message, timeout time.Duration) (rep *Message, err error) {
+	repCh := make(chan *Message)
 	errCh := make(chan error)
 	reader := conn.Reader()
 	defer reader.Close()
@@ -342,7 +342,7 @@ func newConn(addr string) (conn *Conn) {
 		frameRead:     make(chan []byte),
 		addReader:     make(chan *Reader, 100),
 		removeReader:  make(chan *Reader, 100),
-		out:           make(chan Message, DEFAULT_WRITE_QUEUE_DEPTH),
+		out:           make(chan *Message, DEFAULT_WRITE_QUEUE_DEPTH),
 		writeErrors:   make(chan error),
 		readError:     make(chan error),
 		nextStream:    make(chan *framed.Framed),
@@ -536,7 +536,7 @@ func (conn *Conn) handleReadError(readError error) {
 	}
 }
 
-func (conn *Conn) handleWrite(msg Message) {
+func (conn *Conn) handleWrite(msg *Message) {
 	idBytes := make([]byte, 8)
 	repIdBytes := make([]byte, 8)
 	if msg.ID == 0 {
@@ -604,7 +604,7 @@ func (conn *Conn) handleFrameRead(frame []byte) {
 				connectionState = orig.ConnectionState()
 			}
 			for _, reader := range conn.readers {
-				reader.in <- Message{MessageID(id), MessageID(repId), data, connectionState}
+				reader.in <- &Message{MessageID(id), MessageID(repId), data, connectionState}
 			}
 		}
 	}
