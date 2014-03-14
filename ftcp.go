@@ -156,7 +156,8 @@ Listen listens on a TCP socket at the given listen address, similarly to
 net.Listen.
 */
 func Listen(laddr string) (listener Listener, err error) {
-	if orig, err := net.Listen("tcp", laddr); err == nil {
+	var orig net.Listener
+	if orig, err = net.Listen("tcp", laddr); err == nil {
 		listener = Listener{orig}
 	}
 	return
