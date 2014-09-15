@@ -57,10 +57,11 @@ import (
 	"crypto/tls"
 	"encoding/binary"
 	"fmt"
-	"github.com/oxtoacart/framed"
 	"io"
 	"net"
 	"time"
+
+	"github.com/getlantern/framed"
 )
 
 const (
@@ -89,6 +90,11 @@ type Message struct {
 	TLSState tls.ConnectionState
 }
 
+type framedStream struct {
+	reader *framed.Reader
+	writer *framed.Writer
+}
+
 /*
 Conn is an ftcp connection to which one can write []byte frames using Write()
 and from which one can receive Messages using Read().
@@ -96,22 +102,22 @@ and from which one can receive Messages using Read().
 Multiple goroutines may invoke methods on a Conn simultaneously.
 */
 type Conn struct {
-	addr          string              // the host:port which the Conn will dial
-	redialTimeout time.Duration       // timeout for attempting redials
-	tlsConfig     *tls.Config         // (optional) TLS configuration for dialing
-	autoRedial    bool                // whether or not to auto-redial
-	orig          interface{}         // the original connection (net.Conn or tls.Conn)
-	stream        *framed.Framed      // framed version of orig
-	readers       []*Reader           // readers reading from this Connection (there is always at least 1, the default reader)
-	frameRead     chan []byte         // channel for frame that was read
-	addReader     chan *Reader        // channel for requests to add readers
-	removeReader  chan *Reader        // channel for requests to remove readers
-	out           chan *Message       // channel to which messages to be written are sent
-	writeErrors   chan error          // channel for reporting errors that happened while writing
-	readError     chan error          // channel for signaling to the process method that it needs to handle an error from the read method
-	nextStream    chan *framed.Framed // channel for telling the read goroutine about the next stream from which it should read (after redialing)
-	stop          chan interface{}    // channel for signaling to the process method that it should stop
-	idSeq         uint64              // sequence number for assigning IDs to messages
+	addr          string             // the host:port which the Conn will dial
+	redialTimeout time.Duration      // timeout for attempting redials
+	tlsConfig     *tls.Config        // (optional) TLS configuration for dialing
+	autoRedial    bool               // whether or not to auto-redial
+	orig          interface{}        // the original connection (net.Conn or tls.Conn)
+	stream        *framedStream      // framed version of orig
+	readers       []*Reader          // readers reading from this Connection (there is always at least 1, the default reader)
+	frameRead     chan []byte        // channel for frame that was read
+	addReader     chan *Reader       // channel for requests to add readers
+	removeReader  chan *Reader       // channel for requests to remove readers
+	out           chan *Message      // channel to which messages to be written are sent
+	writeErrors   chan error         // channel for reporting errors that happened while writing
+	readError     chan error         // channel for signaling to the process method that it needs to handle an error from the read method
+	nextStream    chan *framedStream // channel for telling the read goroutine about the next stream from which it should read (after redialing)
+	stop          chan interface{}   // channel for signaling to the process method that it should stop
+	idSeq         uint64             // sequence number for assigning IDs to messages
 }
 
 /*
@@ -182,7 +188,10 @@ func (listener *Listener) Accept() (conn *Conn, err error) {
 	if orig, err = listener.Listener.Accept(); err == nil {
 		conn = newConn("")
 		conn.orig = &orig
-		conn.stream = &framed.Framed{orig}
+		conn.stream = &framedStream{
+			reader: framed.NewReader(orig),
+			writer: framed.NewWriter(orig),
+		}
 		conn.run()
 	}
 	return
@@ -346,7 +355,7 @@ func newConn(addr string) (conn *Conn) {
 		out:           make(chan *Message, DEFAULT_WRITE_QUEUE_DEPTH),
 		writeErrors:   make(chan error),
 		readError:     make(chan error),
-		nextStream:    make(chan *framed.Framed),
+		nextStream:    make(chan *framedStream),
 		stop:          make(chan interface{}),
 	}
 	return conn
@@ -365,7 +374,10 @@ func (conn *Conn) dial() (err error) {
 
 	if err == nil {
 		conn.orig = &orig
-		conn.stream = &framed.Framed{orig}
+		conn.stream = &framedStream{
+			reader: framed.NewReader(orig),
+			writer: framed.NewWriter(orig),
+		}
 	}
 
 	return
@@ -421,7 +433,7 @@ is nil, reading simply stops.  If the message is a stream, then reading stops
 and a new goroutine is launched to read from the new stream.  This is used on
 autoRedial connections in which a write error triggered a redial.
 */
-func (conn *Conn) read(stream *framed.Framed) {
+func (conn *Conn) read(stream *framedStream) {
 	for {
 		select {
 		case nextStream := <-conn.nextStream:
@@ -430,13 +442,14 @@ func (conn *Conn) read(stream *framed.Framed) {
 			}
 			return
 		default:
-			if frame, err := conn.stream.ReadFrame(); err != nil {
+			b := make([]byte, framed.MAX_FRAME_SIZE)
+			if n, err := conn.stream.reader.Read(b); err != nil {
 				// Unable to read, report error for handling in process()
 				conn.readError <- err
 				return
 			} else {
 				// Read succeeded, report frame
-				conn.frameRead <- frame
+				conn.frameRead <- b[:n]
 			}
 		}
 	}
@@ -509,7 +522,7 @@ func (conn *Conn) writeFrame(byteArrays ...[]byte) (redialed bool, err error) {
 	for {
 		var start = time.Now()
 		var backoff time.Duration
-		if err = conn.stream.WriteFrame(byteArrays...); err == nil {
+		if _, err = conn.stream.writer.WritePieces(byteArrays...); err == nil {
 			return
 		} else {
 			if conn.autoRedial && err == io.EOF {
